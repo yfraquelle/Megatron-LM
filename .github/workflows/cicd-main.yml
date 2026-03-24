@@ -160,7 +160,9 @@ jobs:
           uv venv
           uv pip install --python .venv/bin/python \
             wheel packaging "setuptools<80.0.0,>=77.0.0"
-          uv sync --locked --only-group linting
+          export NVTE_CUDA_ARCHS="80;90;100"
+          export NVTE_FRAMEWORK=none
+          uv sync --frozen --only-group linting
 
       - name: Get PR info
         id: get-pr-info
