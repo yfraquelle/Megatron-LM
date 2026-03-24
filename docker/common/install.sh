@@ -110,6 +110,10 @@ main() {
                 "--no-install-package" "nvidia-cusparselt-cu12"
                 "--no-install-package" "nvidia-nccl-cu12"
             )
+            # Transformer Engine probes CUDA during metadata generation when NVTE_CUDA_ARCHS
+            # is unset. The PyTorch base image omits the CUDA runtime Python package metadata,
+            # so provide the same explicit architectures we use in the CI Docker image.
+            export NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS:-80;90;100}"
         else
             UV_ARGS=()
         fi
