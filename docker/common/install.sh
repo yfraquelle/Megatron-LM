@@ -127,11 +127,12 @@ main() {
         uv pip install --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
             pybind11 wheel packaging "setuptools<80.0.0,>=77.0.0"
 
-        # Install dependencies
-        uv sync --locked --only-group build ${UV_ARGS[@]}
+        # Use the checked-in lockfile as-is. With uv 0.7.2, --locked revalidates
+        # git-source metadata and rejects this repo's hand-maintained lockfile.
+        uv sync --frozen --only-group build ${UV_ARGS[@]}
         uv sync \
             --link-mode copy \
-            --locked \
+            --frozen \
             --extra ${ENVIRONMENT} \
             --all-groups ${UV_ARGS[@]}
 

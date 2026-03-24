@@ -13,7 +13,7 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 WORKDIR /opt/megatron-lm
 COPY pyproject.toml uv.lock /opt/megatron-lm/
 COPY megatron/core/package_info.py megatron/core/__init__.py /opt/megatron-lm/megatron/core/
-RUN uv sync --locked --only-group linting --only-group test --only-group ci
+RUN uv sync --frozen --only-group linting --only-group test --only-group ci
 
 ##### For NVIDIANS only #####
 FROM main as jet
