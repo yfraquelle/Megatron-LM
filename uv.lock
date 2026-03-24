@@ -1470,6 +1470,16 @@ wheels = [
 ]
 
 [[package]]
+name = "fast-hadamard-transform"
+version = "1.0.4.post1"
+source = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca#f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+dependencies = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+]
+
+[[package]]
 name = "fiddle"
 version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2645,6 +2655,7 @@ dev = [
     { name = "emerging-optimizers", marker = "python_full_version >= '3.12'" },
     { name = "fastapi" },
     { name = "flash-linear-attention" },
+    { name = "fast-hadamard-transform" },
     { name = "flashinfer-python" },
     { name = "flask", extra = ["async"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "hypercorn" },
@@ -2673,6 +2684,7 @@ lts = [
     { name = "einops" },
     { name = "emerging-optimizers", marker = "python_full_version >= '3.12'" },
     { name = "fastapi" },
+    { name = "fast-hadamard-transform" },
     { name = "flashinfer-python" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-lts'" },
