@@ -1,10 +1,24 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from typing import Protocol
 import torch
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 
+class LayerNormInterface(Protocol):
+    """Interface that all LayerNorm implementations should follow."""
+
+    def forward(self, x: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for a LayerNorm implementation."""
+        ...
+
+class LayerNormBuilder(Protocol):
+    """A protocol showing how Modules are expected to construct LayerNorms."""
+
+    def __call__(
+        self, *, config: TransformerConfig, hidden_size: int, eps: float
+    ) -> LayerNormInterface: ...
 
 class WrappedTorchNorm:
     """

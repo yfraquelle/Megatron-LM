@@ -546,6 +546,66 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         cpu_offload_handler.on_group_start_backward()
         return grad_output, None, None
 
+class FineGrainedActivationOffloadingInterface:
+    """Interface for fine-grained activation offloading."""
+
+    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+        self.offload = offload
+        self.tensor = tensor
+        self.name = name
+
+    def __enter__(self):
+        """Enter context manager to enable activation offloading hooks."""
+        if self.offload:
+            self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+            PipelineOffloadManager.get_instance().__enter__()
+        return self.tensor
+
+    def __exit__(self, *args: Any):
+        """Exit context manager to disable activation offloading hooks."""
+        if self.offload:
+            PipelineOffloadManager.get_instance().__exit__()
+
+    @staticmethod
+    def init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
+        """Initialize the chunk handler, called at the start of a microbatch forward pass."""
+        PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+            vp_size, vp_stage, min_offloaded_tensor_size
+        )
+
+    @staticmethod
+    def get_context(flag):
+        """Get the fine-grained offload context"""
+        return PipelineOffloadManager.get_instance() if flag else nullcontext()
+
+    @staticmethod
+    def group_commit(tensor, name, forced_released_tensors=None, delay_offload=False):
+        """Group commit the tensors."""
+        return fine_grained_offloading_group_commit(
+            tensor, name, forced_released_tensors, delay_offload
+        )
+
+    @staticmethod
+    def mark_not_offloadable(tensor: torch.Tensor):
+        """Mark the tensor as not offloadable."""
+        PipelineOffloadManager.get_instance().mark_not_offloadable(tensor)
+
+    @staticmethod
+    def forward_record(event: torch.cuda.Event) -> None:
+        """Record the forward event for cuda graph capture."""
+        d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
+        torch.cuda.current_stream().record_event(event)
+        torch.cuda.current_stream().wait_stream(d2h_stream)
+
+    @staticmethod
+    def reset():
+        """Reset the chunk handler."""
+        PipelineOffloadManager.get_instance().reset()
+
+    @staticmethod
+    def reset_instance():
+        """Reset the singleton instance."""
+        PipelineOffloadManager.reset_instance()
 
 def fine_grained_offloading_group_start(tensor, name=None):
     """Mark the start of a layer group and prepare for offload/reload."""
