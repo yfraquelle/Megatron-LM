@@ -924,11 +924,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
 
-                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                assert self.linear_num_key_heads % tp_cp_size == 0, (
+                assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0 and self.linear_num_value_heads % self.context_parallel_size == 0, (
                     f"{self.linear_num_key_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                    f"({self.tensor_model_parallel_size=} and {self.context_parallel_size=})."
                 )
+
+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
                 assert self.linear_num_value_heads % tp_cp_size == 0, (
                     f"{self.linear_num_value_heads=} must be a multiple of "
                     f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."

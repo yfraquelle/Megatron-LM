@@ -136,6 +136,44 @@ class GatedDeltaNet(MegatronModule):
         self.v_dim = self.value_head_dim * self.num_value_heads
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
+        self.num_key_heads_local_tp = self.num_key_heads // self.tp_size
+        self.num_value_heads_local_tp = self.num_value_heads // self.tp_size
+        self.num_value_heads_per_key = self.num_value_heads // self.num_key_heads
+
+        # When one TP shard does not contain enough q/k heads to further shard by CP,
+        # gather only q/k across TP before CP. The value path stays TP-local.
+        self.full_tp_before_cp = (
+            self.tp_size > 1
+            and self.cp_size > 1
+            and self.num_key_heads_local_tp < self.cp_size
+        )
+
+        self.qk_dim_before_cp = self.qk_dim if self.full_tp_before_cp else self.qk_dim_local_tp
+        self.v_dim_before_cp = self.v_dim_local_tp
+        self.num_key_heads_before_cp = (
+            self.num_key_heads if self.full_tp_before_cp else self.num_key_heads_local_tp
+        )
+        self.num_value_heads_before_cp = self.num_value_heads_local_tp
+        self.gate_dim_before_cp = self.v_dim_before_cp
+        self.beta_alpha_dim_before_cp = self.num_value_heads_before_cp
+        self.conv_dim_before_cp = self.qk_dim_before_cp * 2 + self.v_dim_before_cp
+
+        assert self.num_key_heads_before_cp % self.cp_size == 0, (
+            self.num_key_heads_before_cp,
+            self.cp_size,
+        )
+        assert self.num_value_heads_before_cp % self.cp_size == 0, (
+            self.num_value_heads_before_cp,
+            self.cp_size,
+        )
+
+        self.qk_dim_after_cp = self.qk_dim_before_cp // self.cp_size
+        self.v_dim_after_cp = self.v_dim_before_cp // self.cp_size
+        self.num_key_heads_after_cp = self.num_key_heads_before_cp // self.cp_size
+        self.num_value_heads_after_cp = self.num_value_heads_before_cp // self.cp_size
+        self.gate_dim_after_cp = self.gate_dim_before_cp // self.cp_size
+        self.beta_alpha_dim_after_cp = self.beta_alpha_dim_before_cp // self.cp_size
+        self.conv_dim_after_cp = self.conv_dim_before_cp // self.cp_size
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
@@ -302,6 +340,7 @@ class GatedDeltaNet(MegatronModule):
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
+        qkvzba = self._prepare_qkvzba_before_cp(qkvzba)
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
@@ -311,12 +350,12 @@ class GatedDeltaNet(MegatronModule):
             head_dim=-1,
             cp_group=self.pg_collection.cp,
             split_sections=[
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
+                self.qk_dim_before_cp,
+                self.qk_dim_before_cp,
+                self.v_dim_before_cp,
+                self.gate_dim_before_cp,
+                self.beta_alpha_dim_before_cp,
+                self.beta_alpha_dim_before_cp,
             ],
         )
 
@@ -328,34 +367,36 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                2 * self.qk_dim_after_cp + self.v_dim_after_cp,
+                self.gate_dim_after_cp,
+                self.beta_alpha_dim_after_cp,
+                self.beta_alpha_dim_after_cp,
             ],
             dim=-1,
         )
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
+        gate = gate.reshape(batch, seq_len, self.num_value_heads_after_cp, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, self.num_value_heads_after_cp)
+        alpha = alpha.reshape(batch, seq_len, self.num_value_heads_after_cp)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
         qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
+            self.qk_dim_before_cp,
+            self.qk_dim_before_cp,
+            self.v_dim_before_cp,
         ]
+        conv1d_weight_base = self._prepare_conv_before_cp(self.conv1d.weight)
+        conv1d_bias_base = self._prepare_conv_before_cp(self.conv1d.bias)
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
+            conv1d_weight_base,
             dim=0,
             cp_group=self.pg_collection.cp,
             split_sections=qkv_channels_split_sections,
         )
         conv1d_bias = (
             get_parameter_local_cp(
-                self.conv1d.bias,
+                conv1d_bias_base,
                 dim=0,
                 cp_group=self.pg_collection.cp,
                 split_sections=qkv_channels_split_sections,
@@ -372,7 +413,7 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_after_cp,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -397,9 +438,11 @@ class GatedDeltaNet(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+        A_log_base = self._regroup_value_tp(self.A_log, dim=0, unit_size=1)
+        dt_bias_base = self._regroup_value_tp(self.dt_bias, dim=0, unit_size=1)
+        A_log_local_cp = get_parameter_local_cp(A_log_base, dim=0, cp_group=self.pg_collection.cp)
         dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
+            dt_bias_base, dim=0, cp_group=self.pg_collection.cp
         )
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
@@ -431,6 +474,7 @@ class GatedDeltaNet(MegatronModule):
         norm_out = tensor_a2a_hp2cp(
             norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
         )
+        norm_out = self._restore_value_tp_for_out_proj(norm_out, dim=-1)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -457,10 +501,9 @@ class GatedDeltaNet(MegatronModule):
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
         """
-        # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_after_cp, self.v_dim_after_cp],
             dim=-1,
         )
 
@@ -472,13 +515,18 @@ class GatedDeltaNet(MegatronModule):
         if self.use_qk_l2norm:
             query_key = l2norm(query_key.contiguous())
 
-        # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.num_key_heads_after_cp
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
-        # Expand query and key if needed (grouped query attention)
-        if self.num_value_heads // self.num_key_heads > 1:
-            repeat_factor = self.num_value_heads // self.num_key_heads
+        # Expand query and key if needed (grouped query attention).
+        # In full_tp_before_cp mode, q/k and value may use different before_cp partitioning,
+        # so the repeat factor must follow the local after_cp head counts.
+        assert self.num_value_heads_after_cp % self.num_key_heads_after_cp == 0, (
+            self.num_value_heads_after_cp,
+            self.num_key_heads_after_cp,
+        )
+        repeat_factor = self.num_value_heads_after_cp // self.num_key_heads_after_cp
+        if repeat_factor > 1:
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
@@ -492,13 +540,100 @@ class GatedDeltaNet(MegatronModule):
 
         return query, key, value, gate, beta, alpha
 
+    def _maybe_gather_qk_full_tp(
+        self, tensor: Optional[torch.Tensor], dim: int, split_sections: List[int]
+    ):
+        if tensor is None or not self.full_tp_before_cp:
+            return tensor
+        sections = list(torch.split(tensor, split_sections, dim=dim))
+        sections[0] = _all_gather_cat_no_reduce(sections[0], dim=dim, group=self.pg_collection.tp)
+        sections[1] = _all_gather_cat_no_reduce(sections[1], dim=dim, group=self.pg_collection.tp)
+        return torch.cat(sections, dim=dim)
+
+    def _regroup_value_tp(self, tensor: Optional[torch.Tensor], dim: int, unit_size: int):
+        if tensor is None or not self.full_tp_before_cp:
+            return tensor
+        assert self.num_value_heads_per_key % self.tp_size == 0, (
+            self.num_value_heads_per_key,
+            self.tp_size,
+        )
+        tensor = _all_gather_cat_no_reduce(tensor, dim=dim, group=self.pg_collection.tp)
+        tensor = torch.movedim(tensor, dim, -1)
+        tensor = tensor.reshape(
+            *tensor.shape[:-1],
+            self.num_key_heads,
+            self.num_value_heads_per_key,
+            unit_size,
+        )
+        heads_per_rank = self.num_value_heads_per_key // self.tp_size
+        tp_rank = self.pg_collection.tp.rank()
+        start = tp_rank * heads_per_rank
+        tensor = tensor[..., start : start + heads_per_rank, :]
+        tensor = tensor.reshape(*tensor.shape[:-3], self.num_value_heads_local_tp * unit_size)
+        return torch.movedim(tensor, -1, dim).contiguous()
+
+    def _prepare_qkvzba_before_cp(self, qkvzba: torch.Tensor) -> torch.Tensor:
+        if not self.full_tp_before_cp:
+            return qkvzba
+        q, k, v, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads_local_tp,
+                self.num_value_heads_local_tp,
+            ],
+            dim=-1,
+        )
+        q = _all_gather_cat_no_reduce(q, dim=-1, group=self.pg_collection.tp)
+        k = _all_gather_cat_no_reduce(k, dim=-1, group=self.pg_collection.tp)
+        v = self._regroup_value_tp(v, dim=-1, unit_size=self.value_head_dim)
+        gate = self._regroup_value_tp(gate, dim=-1, unit_size=self.value_head_dim)
+        beta = self._regroup_value_tp(beta, dim=-1, unit_size=1)
+        alpha = self._regroup_value_tp(alpha, dim=-1, unit_size=1)
+        return torch.cat([q, k, v, gate, beta, alpha], dim=-1)
+
+    def _prepare_conv_before_cp(self, tensor: Optional[torch.Tensor]):
+        if tensor is None or not self.full_tp_before_cp:
+            return tensor
+        q, k, v = torch.split(
+            tensor,
+            [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp],
+            dim=0,
+        )
+        q = _all_gather_cat_no_reduce(q, dim=0, group=self.pg_collection.tp)
+        k = _all_gather_cat_no_reduce(k, dim=0, group=self.pg_collection.tp)
+        v = self._regroup_value_tp(v, dim=0, unit_size=self.value_head_dim)
+        return torch.cat([q, k, v], dim=0)
+
+    def _restore_value_tp_for_out_proj(self, tensor: torch.Tensor, dim: int):
+        if not self.full_tp_before_cp:
+            return tensor
+        heads_per_rank = self.num_value_heads_per_key // self.tp_size
+        tensor = torch.movedim(tensor, dim, -1)
+        tensor = tensor.reshape(
+            *tensor.shape[:-1],
+            self.num_key_heads,
+            heads_per_rank,
+            self.value_head_dim,
+        )
+        tensor = _all_gather_cat_no_reduce(tensor, dim=-2, group=self.pg_collection.tp)
+        tensor = tensor.reshape(*tensor.shape[:-3], self.num_value_heads, self.value_head_dim)
+        tensor = tensor.reshape(*tensor.shape[:-2], self.v_dim)
+        tp_rank = self.pg_collection.tp.rank()
+        start = tp_rank * self.v_dim_local_tp
+        tensor = tensor[..., start : start + self.v_dim_local_tp]
+        return torch.movedim(tensor, -1, dim).contiguous()
+
     @jit_fuser
     def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
         """
         Compute g (decay) and beta (sigmoid) for gated delta rule.
         Fuses exp, softplus, mul, neg, and sigmoid operations.
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        g = -A_log_local_cp.float().exp() * F.softplus(alpha.float() + dt_bias_local_cp.float())
         beta = beta.sigmoid()
         return g, beta
 
@@ -836,6 +971,31 @@ def tensor_a2a_hp2cp(
         tensor = _all_to_all_hp2cp(tensor, cp_group)
 
     return tensor
+
+class _AllGatherCatNoReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, dim, group):
+        ctx.dim = dim
+        ctx.group = group
+        ctx.rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        outputs = [torch.empty_like(x) for _ in range(world_size)]
+        torch.distributed.all_gather(outputs, x.contiguous(), group=group)
+        return torch.cat(outputs, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dim = ctx.dim if ctx.dim >= 0 else grad_output.dim() + ctx.dim
+        world_size = torch.distributed.get_world_size(group=ctx.group)
+        split_size = grad_output.size(dim) // world_size
+        grad_input = torch.narrow(grad_output, dim, ctx.rank * split_size, split_size).contiguous()
+        return grad_input, None, None
+
+
+def _all_gather_cat_no_reduce(x, dim, group):
+    if torch.distributed.get_world_size(group=group) == 1:
+        return x
+    return _AllGatherCatNoReduce.apply(x, dim, group)
 
 
 ####################
